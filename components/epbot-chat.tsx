@@ -27,7 +27,9 @@ import {
   Copy,
   Volume2,
   Square,
+  Trophy,
 } from "lucide-react";
+import { ModelIcon } from "@/components/model-icon";
 import { fetchEventSource } from "@microsoft/fetch-event-source";
 import { cn } from "@/lib/utils";
 import { speech, markdownToPlainText } from "@/lib/speech";
@@ -158,6 +160,8 @@ type Message = {
   failed?: boolean;
   /** 失败是否属于服务端问题；false（403/429 等请求侧问题）时不展示链路自检 */
   serverSideFailed?: boolean;
+  /** 等待 AI 处理的时长（毫秒）：从发起请求到收到第一段内容 */
+  waitMs?: number;
 };
 
 interface Session {
@@ -182,6 +186,7 @@ interface Model {
 const STORAGE_KEY = "epbot_sessions";
 const CURRENT_SESSION_KEY = "epbot_current_session_id";
 const SELECTED_MODEL_KEY = "epbot_selected_model";
+const DEEP_THINKING_KEY = "epbot_deep_thinking";
 const MAX_STORAGE_PERCENT = 0.9;
 const MAX_CONTEXT_MESSAGES = 25;
 const DEFAULT_MODEL_ID = "grok-4.7";
@@ -208,6 +213,7 @@ const RECOMMENDED_PATTERNS: RegExp[] = [
   /llama-4-maverick/i, // Meta Llama 4 旗舰
   /minimax-m\d+/i, // MiniMax
   /grok-chat-(?:fast|expert)/i, // Grok 快速 / 专家档
+  /(?:^|\/)epai-\d+(?:\.\d+)?$/i, // EndlessPixel 自研模型（epai-1.0 等）
 ];
 
 // 一票否决：命中即不推荐（轻量档、预览/实验档、专用分支）。
@@ -262,45 +268,44 @@ const generateTitle = (messages: Message[]): string => {
   return firstUserMsg.slice(0, 20) + (firstUserMsg.length > 20 ? "…" : "") || "新对话";
 };
 
-// ---- <thinking> tag parsing -------------------------------------------
-// The model is instructed to optionally start its reply with a single
-// <thinking>...</thinking> block. We parse it out so the UI can render the
-// reasoning as a collapsible section, including the streaming middle state
-// where the closing tag has not arrived yet.
-const THINKING_OPEN = "<thinking>";
-const THINKING_CLOSE = "</thinking>";
+// ---- 思考块解析 -----------------------------------------------------------
+// 模型可能用两种格式输出推理过程：
+//   1. `<thinking>...</thinking>` —— 提示词要求的标准格式
+//   2. `<think>...</think>` —— 部分模型（DeepSeek-R1 / Qwen 等）的原生格式，不遵循提示词
+// 两种都解析成可折叠的「思考区」，并正确处理流式中间态（闭合标签还没到达）。
+const THINKING_TAGS: { open: string; close: string }[] = [
+  { open: "<thinking>", close: "</thinking>" },
+  { open: "\u003cthink\u003e", close: "\u003c/think\u003e" },
+];
 
 type ParsedThinking = {
   thinking: string;
   answer: string;
-  /** false while streaming inside an unclosed <thinking> block */
+  /** false while streaming inside an unclosed thinking block */
   thinkingDone: boolean;
 };
 
 const parseThinking = (content: string): ParsedThinking => {
   const trimmed = content.trimStart();
   const lower = trimmed.toLowerCase();
-  // Streaming edge case: we only received a partial opening tag (e.g. "<think").
-  // Hide it instead of flashing raw tag text.
-  if (
-    trimmed.length > 0 &&
-    trimmed.length < THINKING_OPEN.length &&
-    THINKING_OPEN.startsWith(lower)
-  ) {
-    return { thinking: "", answer: "", thinkingDone: false };
-  }
-  if (!lower.startsWith(THINKING_OPEN)) {
+  const tag = THINKING_TAGS.find((t) => lower.startsWith(t.open));
+  if (!tag) {
+    // Streaming edge case: we only received a partial opening tag (e.g. "<think"
+    // or "<thi"). Hide it instead of flashing raw tag text.
+    if (trimmed.length > 0 && THINKING_TAGS.some((t) => t.open.startsWith(lower))) {
+      return { thinking: "", answer: "", thinkingDone: false };
+    }
     return { thinking: "", answer: content, thinkingDone: true };
   }
-  const rest = trimmed.slice(THINKING_OPEN.length);
-  const closeIdx = rest.toLowerCase().indexOf(THINKING_CLOSE);
+  const rest = trimmed.slice(tag.open.length);
+  const closeIdx = rest.toLowerCase().indexOf(tag.close);
   if (closeIdx === -1) {
     // Opening tag seen, closing tag not yet streamed in.
     return { thinking: rest.trim(), answer: "", thinkingDone: false };
   }
   return {
     thinking: rest.slice(0, closeIdx).trim(),
-    answer: rest.slice(closeIdx + THINKING_CLOSE.length).replace(/^\s+/, ""),
+    answer: rest.slice(closeIdx + tag.close.length).replace(/^\s+/, ""),
     thinkingDone: true,
   };
 };
@@ -308,7 +313,10 @@ const parseThinking = (content: string): ParsedThinking => {
 // Remove thinking blocks before sending history back to the model, so the
 // context window is not wasted on old reasoning traces.
 const stripThinking = (content: string): string => {
-  const stripped = content.replace(/<thinking>[\s\S]*?<\/thinking>\s*/gi, "").trim();
+  const stripped = content
+    .replace(/<thinking>[\s\S]*?<\/thinking>\s*/gi, "")
+    .replace(/\u003cthink\u003e[\s\S]*?\u003c\/think\u003e\s*/gi, "")
+    .trim();
   return stripped || content;
 };
 
@@ -319,7 +327,7 @@ const ThinkingBlock = ({ thinking, streaming }: { thinking: string; streaming: b
     <div className="not-prose mb-2 overflow-hidden rounded-xl border border-border bg-background text-xs">
       <button
         onClick={() => setExpanded((v) => !v)}
-        className="flex w-full items-center gap-1.5 px-3 py-2 text-muted-foreground transition-colors duration-200 hover:text-foreground"
+        className="flex w-full items-center gap-1.5 px-3 py-2 text-foreground/70 transition-colors duration-200 hover:text-foreground"
       >
         <Brain className={cn("h-3.5 w-3.5 shrink-0", streaming && "animate-pulse")} />
         <span>{streaming ? "思考中…" : "已完成思考"}</span>
@@ -390,7 +398,7 @@ const AiHealthBoard = () => {
   }, []);
 
   // 第一个不通的层就是断点。前两层恒为 true，所以断点只可能落在
-  // nginx / 代理服务器 / 上游服务 上。
+  // 代理服务器 / 上游服务 上。
   const broken = layers?.find((layer) => !layer.ok);
   const summary = broken ? `断点在「${broken.label}」` : "";
 
@@ -445,6 +453,7 @@ export const EPBotChat = ({ isOpen, onClose, className }: EPBotChatProps) => {
   const [models, setModels] = useState<Model[]>([]);
   const [filteredModels, setFilteredModels] = useState<Model[]>([]);
   const [selectedModel, setSelectedModel] = useState<string>("");
+  const [deepThinking, setDeepThinking] = useState(true);
   const [modelsLoaded, setModelsLoaded] = useState(false);
   const [loadingModels, setLoadingModels] = useState(false);
   const [showModelPanel, setShowModelPanel] = useState(false);
@@ -667,6 +676,9 @@ export const EPBotChat = ({ isOpen, onClose, className }: EPBotChatProps) => {
     setLoading(true);
     const controller = new AbortController();
     abortControllerRef.current = controller;
+    // 等待时长：从发起请求到收到第一段内容（含错误事件）
+    const startedAt = Date.now();
+    let firstResponseAt: number | null = null;
     let reply = "";
     let receivedContent = false;
     // 失败是否属于服务端问题：只有服务端问题才在消息下方展示链路自检。
@@ -682,6 +694,7 @@ export const EPBotChat = ({ isOpen, onClose, className }: EPBotChatProps) => {
             msg.role === "assistant" ? { ...msg, content: stripThinking(msg.content) } : msg,
           ),
           model: selectedModel || undefined,
+          deepThinking,
         }),
         signal: controller.signal,
         async onopen(response) {
@@ -697,6 +710,30 @@ export const EPBotChat = ({ isOpen, onClose, className }: EPBotChatProps) => {
           if (ev.data === "[DONE]") return;
           try {
             const j = JSON.parse(ev.data);
+
+            // 第一段响应（正文或错误）到达时记录等待时长，只写一次。
+            // 后续增量更新都基于 {...last} 展开，因此这个字段会被保留下来。
+            if (firstResponseAt === null) {
+              firstResponseAt = Date.now();
+              const waitMs = firstResponseAt - startedAt;
+              const stamp = (list: Message[]) => {
+                const last = list[list.length - 1];
+                if (last?.role === "assistant") list[list.length - 1] = { ...last, waitMs };
+              };
+              setMessages((prev) => {
+                const next = [...prev];
+                stamp(next);
+                return next;
+              });
+              setSessions((prev) =>
+                prev.map((s) => {
+                  if (s.id !== currentSessionIdRef.current) return s;
+                  const msgs = [...s.messages];
+                  stamp(msgs);
+                  return { ...s, messages: msgs };
+                }),
+              );
+            }
 
             if (j.type === "error") {
               const errorMsg = j.message || j.errorText || "未知错误";
@@ -792,10 +829,14 @@ export const EPBotChat = ({ isOpen, onClose, className }: EPBotChatProps) => {
       // Connection/open errors are already surfaced via onerror.
       // Aborted (user-initiated) requests need no extra handling.
     } finally {
-      setLoading(false);
-      sendingRef.current = false;
+      // 只有「当前仍生效的请求」才能清理全局状态。
+      // 被取消的旧请求其 finally 会晚一步执行：若无条件 setLoading(false)，
+      // 会把刚发起的新请求（例如编辑后立刻重发）的加载态提前关掉，
+      // 导致停止按钮变回发送按钮、还能被重复提交。
       if (abortControllerRef.current === controller) {
         abortControllerRef.current = null;
+        setLoading(false);
+        sendingRef.current = false;
       }
       // Replace the empty assistant placeholder with a fallback message.
       // Skip when the request was aborted by the user (delete/edit/switch),
@@ -808,6 +849,8 @@ export const EPBotChat = ({ isOpen, onClose, className }: EPBotChatProps) => {
           senderName: "EPBot",
           failed: true,
           serverSideFailed,
+          // 一个有效事件都没收到时，等待时长即整段请求耗时（否则这条会没有时长显示）
+          waitMs: firstResponseAt ? firstResponseAt - startedAt : Date.now() - startedAt,
         };
         setSessions((prev) =>
           prev.map((s) => {
@@ -881,6 +924,13 @@ export const EPBotChat = ({ isOpen, onClose, className }: EPBotChatProps) => {
       showToast("⚠️ 内容不能为空");
       setEditId(null);
       return;
+    }
+    // AI 还在回复时必须先取消这次请求。
+    // 否则下面的 sendMessage() 会被开头的 sendingRef 守卫静默 return，
+    // 而消息列表已经在上一步被截断 —— 结果是新消息没发出去、原来的也被删掉，
+    // 表现为「编辑并发送后消息丢失」。
+    if (loadingRef.current || sendingRef.current) {
+      cancelCurrentRequest();
     }
     const truncated = messages.slice(0, index);
     updateCurrentMessages(truncated);
@@ -980,6 +1030,8 @@ export const EPBotChat = ({ isOpen, onClose, className }: EPBotChatProps) => {
 
     const savedModel = localStorage.getItem(SELECTED_MODEL_KEY);
     if (savedModel) setSelectedModel(savedModel);
+    const savedDeepThinking = localStorage.getItem(DEEP_THINKING_KEY);
+    if (savedDeepThinking !== null) setDeepThinking(savedDeepThinking === "true");
   }, []);
 
   // Cleanup on unmount: abort requests and clear timers
@@ -1205,6 +1257,7 @@ export const EPBotChat = ({ isOpen, onClose, className }: EPBotChatProps) => {
                       setShowModelPanel(!showModelPanel);
                     }}
                   >
+                    {selectedModel && <ModelIcon modelId={selectedModel} size={16} />}
                     <span className="hidden max-w-60 truncate sm:inline">
                       {currentModel?.name || selectedModel || "选择模型"}
                     </span>
@@ -1235,6 +1288,25 @@ export const EPBotChat = ({ isOpen, onClose, className }: EPBotChatProps) => {
                             </div>
                           </div>
                         </div>
+
+                        <label className="mb-3 flex cursor-pointer items-center justify-between rounded-xl bg-muted p-2.5">
+                          <span className="flex items-center gap-2 text-sm text-foreground">
+                            <Brain className="h-4 w-4 text-muted-foreground" />
+                            深度思考
+                            <span className="text-xs text-muted-foreground">
+                              （回复前先推理，稍慢但更稳）
+                            </span>
+                          </span>
+                          <input
+                            type="checkbox"
+                            checked={deepThinking}
+                            onChange={(e) => {
+                              setDeepThinking(e.target.checked);
+                              localStorage.setItem(DEEP_THINKING_KEY, String(e.target.checked));
+                            }}
+                            className="h-4 w-4 cursor-pointer rounded"
+                          />
+                        </label>
 
                         <div className="space-y-2">
                           <div className="relative">
@@ -1315,6 +1387,7 @@ export const EPBotChat = ({ isOpen, onClose, className }: EPBotChatProps) => {
                               <div className="flex items-start justify-between">
                                 <div className="min-w-0 flex-1">
                                   <div className="flex flex-wrap items-center gap-2">
+                                    <ModelIcon modelId={model.id} size={16} />
                                     <div className="truncate text-sm font-medium text-foreground">
                                       {model.name}
                                     </div>
@@ -1341,6 +1414,20 @@ export const EPBotChat = ({ isOpen, onClose, className }: EPBotChatProps) => {
                           ))
                         )}
                       </div>
+
+                      {/* 榜单放在独立页面：面板里已经塞了搜索/排序/推荐筛选，再挤一张表会很挤 */}
+                      <a
+                        href="/rankings"
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="mt-2 flex items-center justify-between rounded-xl border-t border-border/60 px-3 pt-3 pb-1 text-xs text-muted-foreground transition-colors duration-200 hover:text-foreground"
+                      >
+                        <span className="flex items-center gap-1.5">
+                          <Trophy className="h-3.5 w-3.5" aria-hidden="true" />
+                          查看模型排行
+                        </span>
+                        <span aria-hidden="true">↗</span>
+                      </a>
                     </div>
                   )}
                 </div>
@@ -1418,6 +1505,14 @@ export const EPBotChat = ({ isOpen, onClose, className }: EPBotChatProps) => {
                     <div className="flex items-center gap-2 text-xs text-muted-foreground/60">
                       <span>{m.senderName}</span>
                       <span>{formatTime(m.timestamp)}</span>
+                      {typeof m.waitMs === "number" && (
+                        <span
+                          className="text-muted-foreground/80"
+                          title="从发送消息到 AI 开始回复的等待时长"
+                        >
+                          等待 {(m.waitMs / 1000).toFixed(1)} 秒
+                        </span>
+                      )}
                       {m.failed && i === messages.length - 1 && (
                         <button
                           onClick={retryLast}

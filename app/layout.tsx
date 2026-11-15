@@ -1,4 +1,5 @@
 import type { Metadata, Viewport } from "next";
+import { BRAND_ASSETS, BRAND_DOMAIN, BRAND_STUDIO_NAME } from "@/lib/brand";
 import { GeistSans } from "geist/font/sans";
 import { GeistMono } from "geist/font/mono";
 import { Noto_Sans_SC } from "next/font/google";
@@ -27,12 +28,11 @@ const notoSansSC = Noto_Sans_SC({
 });
 
 // 常量统一管理
-const BRAND_NAME = "EndlessPixel Studio";
+const BRAND_NAME = BRAND_STUDIO_NAME;
 const CURRENT_YEAR = new Date().getFullYear().toString();
-const DOMAIN = "https://www.endlesspixel.cn";
-const LOGO = `${DOMAIN}/EndlessPixel.png`;
-const FAVICON_ICO = "/favicon.ico";
-const BANNER_IMAGE = `${DOMAIN}/banner.jpg`;
+const DOMAIN = BRAND_DOMAIN;
+const LOGO = `${DOMAIN}${BRAND_ASSETS.logo}`;
+const BANNER_IMAGE = `${DOMAIN}${BRAND_ASSETS.banner}`;
 
 // 官方社交矩阵
 const SOCIAL_LINKS = {
@@ -68,13 +68,15 @@ export const metadata: Metadata = {
   description:
     "EndlessPixel 是免费纯净的 Minecraft Java 服务器，支持 1.7.2-26.3 版本，用 Purpur 核心运行，不收费、没广告。",
   keywords: [
+    "Minecraft",
     "Minecraft服务器",
     "免费MC服务器",
     "Java版服务器",
     "Purpur核心",
     "我的世界公益服",
     "EndlessPixel",
-    "1.21服务器",
+    "跨多版本服务器",
+    "26.3",
     "无尽像素",
   ],
   authors: [{ name: BRAND_NAME }],
@@ -110,12 +112,12 @@ export const metadata: Metadata = {
 
   icons: {
     icon: [
-      { url: "/icon.png", type: "image/png", sizes: "256x256" },
-      { url: FAVICON_ICO, type: "image/x-icon" },
+      { url: BRAND_ASSETS.iconPng, type: "image/png", sizes: "256x256" },
+      { url: BRAND_ASSETS.faviconIco, type: "image/x-icon" },
     ],
     apple: [
       {
-        url: "/apple-touch-icon.png",
+        url: BRAND_ASSETS.appleTouchIcon,
         sizes: "180x180",
         type: "image/png",
         rel: "apple-touch-icon",
